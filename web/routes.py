@@ -10,10 +10,11 @@
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Optional
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request
 
 from engine import new_id
 from engine.executor import TestExecutor
@@ -520,10 +521,15 @@ def delete_defect(defect_id: str):
 # ---------------------------------------------------------------------------
 # 环境管理
 # ---------------------------------------------------------------------------
+#
+# 安全约定：本组接口返回的环境一律走 ``EnvironmentManager.public_view``，
+# 敏感变量只输出掩码；导出 / 对比接口同理。真实值只存在于执行器注入链路
+# （``to_executor_config``），不经过任何 HTTP 出口。
 
 @api.get("/projects/<project_id>/environments")
 def list_environments(project_id: str):
-    return jsonify({"environments": _env_mgr().list(project_id)})
+    envs = _env_mgr().list(project_id)
+    return jsonify({"environments": [_env_mgr().public_view(e) for e in envs]})
 
 
 @api.post("/projects/<project_id>/environments")
@@ -531,7 +537,42 @@ def create_environment(project_id: str):
     data = _payload()
     if not (data.get("name") or "").strip():
         return _err("环境名称不能为空")
-    return jsonify(_env_mgr().create(project_id, data))
+    return jsonify(_env_mgr().public_view(_env_mgr().create(project_id, data)))
+
+
+@api.get("/environments/diff")
+def diff_environments():
+    """对比两个环境的变量 / 依赖 / 运行参数（敏感值掩码）。"""
+    a_id = request.args.get("a")
+    b_id = request.args.get("b")
+    if not a_id or not b_id:
+        return _err("请提供要对比的两个环境 id（参数 a 与 b）")
+    result = _env_mgr().diff(a_id, b_id)
+    if "error" in result:
+        return _err(result["error"], 404)
+    return jsonify(result)
+
+
+@api.get("/environments/diff/export")
+def export_environment_diff():
+    """导出环境对比结果（JSON 附件，敏感值掩码），用于留档。"""
+    a_id = request.args.get("a")
+    b_id = request.args.get("b")
+    if not a_id or not b_id:
+        return _err("请提供要对比的两个环境 id（参数 a 与 b）")
+    result = _env_mgr().diff(a_id, b_id)
+    if "error" in result:
+        return _err(result["error"], 404)
+    doc = {
+        "type": "environment-diff-export",
+        "version": 1,
+        "exported_at": time.time(),
+        "diff": result,
+    }
+    filename = f"env-diff-{a_id}-vs-{b_id}.json"
+    return Response(json.dumps(doc, ensure_ascii=False, indent=2),
+                    mimetype="application/json",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
 @api.get("/environments/<env_id>")
@@ -539,7 +580,7 @@ def get_environment(env_id: str):
     env = _env_mgr().get(env_id)
     if env is None:
         return _err("环境不存在", 404)
-    return jsonify(env)
+    return jsonify(_env_mgr().public_view(env))
 
 
 @api.put("/environments/<env_id>")
@@ -551,7 +592,7 @@ def update_environment(env_id: str):
     patch = {k: data[k] for k in ("name", "description", "python_version",
                                   "base_image", "variables", "dependencies", "config")
              if k in data}
-    return jsonify(_env_mgr().update(env_id, patch))
+    return jsonify(_env_mgr().public_view(_env_mgr().update(env_id, patch)))
 
 
 @api.delete("/environments/<env_id>")
@@ -563,6 +604,18 @@ def delete_environment(env_id: str):
 @api.get("/environments/<env_id>/resolve")
 def resolve_environment(env_id: str):
     return jsonify(_env_mgr().resolve(env_id))
+
+
+@api.get("/environments/<env_id>/export")
+def export_environment(env_id: str):
+    """导出环境定义（JSON 附件）。敏感变量值只输出掩码。"""
+    doc = _env_mgr().export(env_id)
+    if doc is None:
+        return _err("环境不存在", 404)
+    filename = f"environment-{env_id}.json"
+    return Response(json.dumps(doc, ensure_ascii=False, indent=2),
+                    mimetype="application/json",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,9 @@
     "base_image": "python:3.11-slim",
     "variables": {
       "BASE_URL": "http://dev.mock.local",
-      "REGION": "dev"
+      "REGION": "dev",
+      "DB_PASSWORD": {"value": "dev-db-passw0rd", "sensitive": true},
+      "API_TOKEN": {"value": "dev-token-8f3k2x", "sensitive": true}
     },
     "dependencies": [
       {
@@ -40,7 +42,9 @@
     "base_image": "python:3.12-slim",
     "variables": {
       "BASE_URL": "http://staging.mock.local",
-      "REGION": "staging"
+      "REGION": "staging",
+      "DB_PASSWORD": {"value": "staging-db-passw0rd", "sensitive": true},
+      "API_TOKEN": {"value": "staging-token-9x7q1", "sensitive": true}
     },
     "dependencies": [
       {

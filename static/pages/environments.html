@@ -10,7 +10,19 @@
     .dep-line { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 13px; }
     .dep-line input { flex: 1; }
     .dep-line input.narrow { max-width: 130px; }
-    .vars-box { font-family: var(--mono); font-size: 12.5px; }
+    .var-line { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 13px; }
+    .var-line input[type="text"] { flex: 1; min-width: 0; }
+    .var-line input.var-key { max-width: 180px; }
+    .var-sensitive { display: flex; align-items: center; gap: 4px; font-size: 12.5px;
+      color: var(--text-muted); white-space: nowrap; margin: 0; }
+    .tag.sensitive { background: #fef3e2; color: var(--amber); }
+    .diff-table th, .diff-table td { font-size: 13px; }
+    tr.diff-changed td { background: #fff8ed; }
+    tr.diff-added td { background: #eefaf1; }
+    tr.diff-removed td { background: #fdecec; }
+    .diff-section { margin-top: 14px; }
+    .diff-section h3 { margin: 0 0 6px; font-size: 14px; }
+    .mono-val { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -19,7 +31,7 @@
 
   <main class="main">
     <h1 class="page-title">环境管理</h1>
-    <p class="page-desc">维护测试环境：运行配置、依赖清单与变量，不同环境之间隔离。</p>
+    <p class="page-desc">维护测试环境：运行配置、依赖清单与变量，不同环境之间隔离。标记为「敏感」的变量只显示掩码，执行时仍注入真实值。</p>
 
     <div class="card">
       <div class="row">
@@ -51,8 +63,11 @@
           <div><label>延迟(ms)</label><input type="number" id="e-latency" value="20"></div>
           <div><label>失败率(0~1)</label><input type="text" id="e-fail" value="0.0"></div>
         </div>
-        <div class="mt"><label>环境变量（JSON）</label>
-          <textarea id="e-vars" class="vars-box" style="min-height:64px">{"REGION":"dev"}</textarea></div>
+        <div class="mt">
+          <label>环境变量（敏感项只保存真实值、界面与日志只显示掩码；编辑时保留掩码不改表示不修改原值）</label>
+          <div id="var-list"></div>
+          <button class="btn secondary small" id="btn-add-var">+ 添加变量</button>
+        </div>
         <div class="mt">
           <label>依赖清单</label>
           <div id="dep-list"></div>
@@ -65,6 +80,19 @@
       </section>
     </div>
 
+    <section class="card">
+      <h2>环境对比</h2>
+      <p class="muted" style="font-size:13px;margin-top:0">切换环境前，逐项对比变量、依赖与运行参数，避免「以为一致其实不一致」。敏感变量只显示掩码；对比结果可导出留档。</p>
+      <div class="row">
+        <select id="diff-a" style="max-width:220px"></select>
+        <span class="muted">对比</span>
+        <select id="diff-b" style="max-width:220px"></select>
+        <button class="btn" id="btn-diff">开始对比</button>
+        <a class="btn secondary" id="btn-diff-export" style="display:none">导出对比结果</a>
+      </div>
+      <div id="diff-result"></div>
+    </section>
+
     <section class="card" id="resolve-card" style="display:none">
       <h2 id="resolve-title">依赖解析</h2>
       <div id="resolve-body"></div>
@@ -76,10 +104,12 @@
 <script>
 renderNav("environments");
 
+const MASK = "******";
 let projectId = null;
 let envs = [];
 let editingId = null;
 let deps = [];
+let vars = [];
 
 async function init() {
   const params = new URLSearchParams(location.search);
@@ -89,10 +119,19 @@ async function init() {
 
 async function switchProject(id) { projectId = id; editingId = null; $("#edit-card").style.display=""; $("#resolve-card").style.display="none"; await loadEnvs(); }
 
+/* ---------- 环境列表 ---------- */
+function varTag(k, v) {
+  // 后端返回 {value, sensitive} 结构；对历史扁平数据做兼容
+  const sens = v && typeof v === "object" && "value" in v ? !!v.sensitive : false;
+  const val = sens ? MASK : (v && typeof v === "object" && "value" in v ? v.value : v);
+  return `<span class="tag ${sens ? "sensitive" : ""}">${sens ? "🔒 " : ""}${esc(k)}=${esc(val)}</span>`;
+}
+
 async function loadEnvs() {
   if (!projectId) return;
   const d = await api(`/api/projects/${projectId}/environments`);
   envs = d.environments || [];
+  renderDiffSelects();
   const host = $("#env-list");
   if (!envs.length) { host.innerHTML = '<div class="empty">还没有环境，点击「新建环境」。</div>'; return; }
   host.innerHTML = envs.map(e => `
@@ -102,15 +141,32 @@ async function loadEnvs() {
           <span class="muted mono" style="font-size:12px">${esc(e.python_version)} · ${esc(e.base_image)}</span></div>
         <div class="row">
           <button class="btn small secondary" onclick="resolve('${e.id}')">解析依赖</button>
+          <a class="btn small secondary" href="/api/environments/${e.id}/export" title="导出环境定义（敏感变量为掩码）">导出</a>
           <button class="btn small secondary" onclick="editEnv('${e.id}')">编辑</button>
           <button class="btn small danger" onclick="delEnv('${e.id}')">删除</button>
         </div>
       </div>
       <div class="mt muted" style="font-size:13px">${(e.dependencies||[]).length} 个依赖 ·
         延迟 ${(e.config||{}).latency_ms||0}ms · 失败率 ${(e.config||{}).fail_rate||0}</div>
-      <div class="mt" style="font-size:12px">${Object.entries(e.variables||{}).map(([k,v]) => `<span class="tag">${esc(k)}=${esc(v)}</span>`).join("")}</div>
+      <div class="mt" style="font-size:12px">${Object.entries(e.variables||{}).map(([k,v]) => varTag(k,v)).join("")}</div>
     </div>`).join("");
 }
+
+/* ---------- 变量编辑器 ---------- */
+function renderVars() {
+  const host = $("#var-list");
+  if (!vars.length) { host.innerHTML = '<div class="muted">暂无变量</div>'; return; }
+  host.innerHTML = vars.map((v, i) => `
+    <div class="var-line">
+      <input type="text" class="var-key" value="${esc(v.key)}" placeholder="变量名，如 DB_PASSWORD" oninput="vars[${i}].key=this.value">
+      <input type="text" value="${esc(v.value)}" placeholder="变量值" oninput="vars[${i}].value=this.value">
+      <label class="var-sensitive" title="敏感变量在页面 / 日志 / 导出 / 对比中只显示掩码">
+        <input type="checkbox" ${v.sensitive ? "checked" : ""} onchange="vars[${i}].sensitive=this.checked">敏感</label>
+      <button class="btn danger small" onclick="vars.splice(${i},1);renderVars()">删除</button>
+    </div>`).join("");
+}
+
+$("#btn-add-var").onclick = () => { vars.push({ key: "", value: "", sensitive: false }); renderVars(); };
 
 function renderDeps() {
   const host = $("#dep-list");
@@ -131,7 +187,7 @@ function newEnv() {
   $("#e-name").value = ""; $("#e-desc").value = ""; $("#e-py").value = "3.11";
   $("#e-image").value = "python:3.11-slim"; $("#e-url").value = "http://mock.local";
   $("#e-latency").value = "20"; $("#e-fail").value = "0.0";
-  $("#e-vars").value = '{"REGION":"dev"}';
+  vars = [{ key: "REGION", value: "dev", sensitive: false }]; renderVars();
   deps = []; renderDeps();
 }
 
@@ -145,7 +201,12 @@ function editEnv(id) {
   $("#e-url").value = (e.config||{}).base_url || "http://mock.local";
   $("#e-latency").value = (e.config||{}).latency_ms ?? 20;
   $("#e-fail").value = (e.config||{}).fail_rate ?? 0;
-  $("#e-vars").value = JSON.stringify(e.variables || {}, null, 1);
+  vars = Object.entries(e.variables || {}).map(([k, v]) => {
+    const sens = v && typeof v === "object" && "value" in v ? !!v.sensitive : false;
+    const val = v && typeof v === "object" && "value" in v ? v.value : v;
+    return { key: k, value: sens ? MASK : (val == null ? "" : String(val)), sensitive: sens };
+  });
+  renderVars();
   deps = (e.dependencies || []).map(d => ({ ...d })); renderDeps();
 }
 
@@ -175,12 +236,16 @@ $("#btn-cancel").onclick = () => { editingId = null; };
 $("#btn-save").onclick = async () => {
   const name = $("#e-name").value.trim();
   if (!name) return toast("请输入环境名称", "error");
-  let vars = {};
-  try { vars = JSON.parse($("#e-vars").value || "{}"); } catch (_) { return toast("环境变量不是合法 JSON", "error"); }
+  const variables = {};
+  for (const v of vars) {
+    const k = v.key.trim();
+    if (!k) continue;
+    variables[k] = { value: v.value, sensitive: !!v.sensitive };
+  }
   const body = {
     name, description: $("#e-desc").value, python_version: $("#e-py").value,
     base_image: $("#e-image").value,
-    variables: vars,
+    variables,
     dependencies: deps.filter(d => d.name.trim()).map(d => ({ name: d.name.trim(), constraint: d.constraint || "*" })),
     config: { base_url: $("#e-url").value, latency_ms: parseInt($("#e-latency").value||"0",10),
       fail_rate: parseFloat($("#e-fail").value||"0") },
@@ -193,6 +258,73 @@ $("#btn-save").onclick = async () => {
     toast("已创建");
   }
   loadEnvs();
+};
+
+/* ---------- 环境对比 ---------- */
+const DIFF_STATUS = {
+  same:    { label: "一致",   cls: "ok" },
+  changed: { label: "有差异", cls: "timeout" },
+  added:   { label: "仅 B 有", cls: "blue" },
+  removed: { label: "仅 A 有", cls: "failed" },
+};
+
+function renderDiffSelects() {
+  const opts = envs.map(e => `<option value="${e.id}">${esc(e.name)}</option>`).join("");
+  $("#diff-a").innerHTML = opts;
+  $("#diff-b").innerHTML = opts;
+  if (envs[0]) $("#diff-a").value = envs[0].id;
+  if (envs[1]) $("#diff-b").value = envs[1].id;
+  else if (envs[0]) $("#diff-b").value = envs[0].id;
+}
+
+function fmtVal(v) {
+  if (v === null || v === undefined) return '<span class="muted">—</span>';
+  if (typeof v === "object") return `<span class="mono-val">${esc(JSON.stringify(v))}</span>`;
+  return `<span class="mono-val">${esc(String(v))}</span>`;
+}
+
+function diffRows(rows, nameFn) {
+  return rows.map(r => {
+    const st = DIFF_STATUS[r.status] || DIFF_STATUS.same;
+    const cls = r.status === "same" ? "" : `diff-${r.status}`;
+    return `<tr class="${cls}">
+      <td>${esc(nameFn(r))}</td>
+      <td>${fmtVal(r.a)}${r.a_sensitive ? ' <span class="tag sensitive">敏感</span>' : ""}</td>
+      <td>${fmtVal(r.b)}${r.b_sensitive ? ' <span class="tag sensitive">敏感</span>' : ""}</td>
+      <td><span class="badge ${st.cls}">${st.label}</span></td>
+    </tr>`;
+  }).join("");
+}
+
+function diffSection(title, rows, nameFn, summary) {
+  const s = summary || {};
+  const head = `<div class="diff-section"><h3>${esc(title)}
+    <span class="muted" style="font-weight:normal;font-size:12px">
+    （差异 ${s.different||0} · 一致 ${s.same||0}）</span></h3>`;
+  if (!rows.length) return head + '<div class="muted" style="font-size:13px">双方都为空</div></div>';
+  return head + `<table class="diff-table"><thead><tr><th style="width:22%">项</th>
+    <th>环境 A</th><th>环境 B</th><th style="width:90px">状态</th></tr></thead>
+    <tbody>${diffRows(rows, nameFn)}</tbody></table></div>`;
+}
+
+$("#btn-diff").onclick = async () => {
+  const a = $("#diff-a").value, b = $("#diff-b").value;
+  if (!a || !b) return toast("请先选择两个环境", "error");
+  const r = await api(`/api/environments/diff?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`);
+  const totalDiff = Object.values(r.summary || {}).reduce((n, s) => n + (s.different || 0), 0);
+  $("#diff-result").innerHTML = `
+    <div class="row mt">
+      <span class="badge ${r.identical ? "ok" : "timeout"}">${r.identical ? "两套环境完全一致" : `共 ${totalDiff} 处差异`}</span>
+      <span class="muted" style="font-size:13px">${esc(r.a.name)}（A） vs ${esc(r.b.name)}（B）· 敏感变量仅显示掩码</span>
+    </div>` +
+    diffSection("环境变量", r.variables, x => x.key, r.summary.variables) +
+    diffSection("依赖", r.dependencies, x => x.name, r.summary.dependencies) +
+    diffSection("运行参数", r.config, x => x.key, r.summary.config) +
+    diffSection("运行时", r.runtime, x => x.key, r.summary.runtime);
+  const exportBtn = $("#btn-diff-export");
+  exportBtn.style.display = "";
+  exportBtn.href = `/api/environments/diff/export?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`;
+  exportBtn.setAttribute("download", "");
 };
 
 init();

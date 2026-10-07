@@ -24,6 +24,10 @@ INTEGRATION_TYPES = ["webhook", "slack", "email", "dingtalk"]
 # 触发来源
 TRIGGER_TYPES = ["manual", "schedule", "webhook", "ci"]
 
+# 敏感环境变量的统一掩码。凡是把变量值带出平台的出口（页面展示、执行日志、
+# 环境导出、环境差异对比及其导出），敏感值一律替换为该掩码，不回显明文。
+SENSITIVE_MASK = "******"
+
 
 def new_id(prefix: str) -> str:
     """生成带前缀的唯一 id（时间戳 + 随机后缀，便于阅读与排查）。"""

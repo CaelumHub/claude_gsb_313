@@ -14,6 +14,12 @@
 
 变量引用：步骤里的 ``actual`` / ``expected`` 等字段若写成 ``${resp.status}``
 这种形式，会在求值前解析成变量表中的实际值（支持 ``a.b.c`` 点路径）。
+
+敏感变量擦除：环境配置可通过 ``sensitive_values`` 传入敏感值列表（如
+数据库口令）。这些值在执行时正常注入变量表，但**绝不许出现在执行结果
+里**——用例结束前，日志、步骤消息、断言明细中的每一处明文都会被替换
+为 ``SENSITIVE_MASK``，从源头保证落盘的构建日志 / 用例日志 / 报告里
+只有掩码。
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ import re
 import time
 from typing import Any, Optional
 
-from .models import new_id
+from .models import SENSITIVE_MASK, new_id
 
 
 class ExecutionError(Exception):
@@ -82,6 +88,37 @@ def resolve_expr(expr: Any, variables: dict) -> Any:
         else str(_lookup_path(mm.group(1), variables)),
         expr,
     )
+
+
+# ---------------------------------------------------------------------------
+# 敏感值擦除
+# ---------------------------------------------------------------------------
+
+def _scrub_text(text: Any, secrets: list) -> Any:
+    """把文本中出现的敏感值替换为掩码（长的先替换，避免子串截断）。"""
+    if not isinstance(text, str) or not secrets:
+        return text
+    for secret in secrets:
+        text = text.replace(secret, SENSITIVE_MASK)
+    return text
+
+
+def _scrub_obj(obj: Any, secrets: list) -> Any:
+    """递归擦除结构里所有字符串中的敏感值。"""
+    if isinstance(obj, str):
+        return _scrub_text(obj, secrets)
+    if isinstance(obj, list):
+        return [_scrub_obj(item, secrets) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _scrub_obj(value, secrets) for key, value in obj.items()}
+    return obj
+
+
+def _collect_secrets(env_config: dict) -> list:
+    """从环境配置里取出敏感值列表，统一转字符串并按长度降序。"""
+    raw = (env_config or {}).get("sensitive_values") or []
+    secrets = {str(v) for v in raw if v is not None and str(v) != ""}
+    return sorted(secrets, key=len, reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +406,7 @@ class TestExecutor:
         self.target = MockTarget(env_config)
         variables = dict(env_config.get("variables", {}))
         variables["case"] = {"id": case_id, "name": case_name}
+        secrets = _collect_secrets(env_config)
 
         logs: list[str] = [
             f"开始执行用例 {case_name} (id={case_id})，超时 {timeout}s",
@@ -379,7 +417,7 @@ class TestExecutor:
 
         if not case.get("enabled", True):
             return self._finalize(case, "skipped", steps_out, [], logs, started,
-                                  "用例已禁用")
+                                  "用例已禁用", secrets=secrets)
 
         steps = case.get("steps") or []
         for idx, step in enumerate(steps):
@@ -410,10 +448,18 @@ class TestExecutor:
             logs.append(f"用例总耗时超过 {timeout}s")
 
         assertions = variables.get("_assertions", [])
-        return self._finalize(case, status, steps_out, assertions, logs, started)
+        return self._finalize(case, status, steps_out, assertions, logs, started,
+                              secrets=secrets)
 
     def _finalize(self, case: dict, status: str, steps: list, assertions: list,
-                  logs: list, started: float, message: str = "") -> dict:
+                  logs: list, started: float, message: str = "",
+                  secrets: Optional[list] = None) -> dict:
+        # 出口前统一擦除：日志 / 步骤消息 / 断言明细里的敏感值只留掩码
+        if secrets:
+            steps = _scrub_obj(steps, secrets)
+            assertions = _scrub_obj(assertions, secrets)
+            logs = _scrub_obj(logs, secrets)
+            message = _scrub_text(message, secrets)
         return {
             "case_id": case.get("id"),
             "case_name": case.get("name", "未命名用例"),
