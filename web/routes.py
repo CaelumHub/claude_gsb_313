@@ -13,9 +13,10 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, current_app, jsonify, request, Response
 
 from engine import new_id
+from engine.environments import make_redactor, sensitive_secret_map
 from engine.executor import TestExecutor
 
 api = Blueprint("api", __name__, url_prefix="/api")
@@ -74,6 +75,39 @@ def _build_or_404(build_id: str):
     if build is None:
         return None, _err("构建不存在", 404)
     return build, None
+
+
+def _redactor_for_env_id(env_id):
+    """按构建所用环境的敏感变量构造脱敏器；环境缺失 / 无敏感项时返回 None。
+
+    这是读取路径上的第二道防线：即便结果文件是在敏感脱敏功能上线前生成、
+    或将来新增了别的写出入口，日志 / 结果接口返回前仍会再脱敏一次。
+    """
+    if not env_id:
+        return None
+    env = _env_mgr().get(env_id)
+    if env is None:
+        return None
+    secrets = sensitive_secret_map(env.get("variables") or {},
+                                   env.get("sensitive_variables") or [])
+    if not secrets:
+        return None
+    return make_redactor(list(secrets.values()))
+
+
+def _download_json(payload: dict, filename: str):
+    """以附件下载形式返回 JSON（用于环境 / 差异导出留档）。"""
+    body = json_dumps(payload)
+    return Response(
+        body,
+        mimetype="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def json_dumps(payload: dict) -> str:
+    import json
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +430,10 @@ def build_results(build_id: str):
     records = store.results(build_id, where=where or None,
                             order_by=request.args.get("order_by") or "order",
                             order=order, limit=limit, offset=offset)
+    # 出口脱敏：敏感变量不随结果文件翻出来
+    redact = _redactor_for_env_id(build.get("env_id"))
+    if redact is not None:
+        records = [redact(r) for r in records]
     return jsonify({"build_id": build_id, "count": len(records), "results": records})
 
 
@@ -406,7 +444,11 @@ def build_logs(build_id: str):
         return err
     store = _builds().for_project(build["project_id"])
     after = request.args.get("after", 0, type=int)
-    return jsonify(store.read_logs(build_id, after=after))
+    payload = store.read_logs(build_id, after=after)
+    redact = _redactor_for_env_id(build.get("env_id"))
+    if redact is not None:
+        payload["lines"] = [redact(line) for line in payload.get("lines", [])]
+    return jsonify(payload)
 
 
 @api.get("/builds/<build_id>/cases/<case_id>/log")
@@ -415,7 +457,11 @@ def case_log(build_id: str, case_id: str):
     if err:
         return err
     store = _builds().for_project(build["project_id"])
-    return jsonify({"case_id": case_id, "log": store.read_case_log(build_id, case_id)})
+    text = store.read_case_log(build_id, case_id)
+    redact = _redactor_for_env_id(build.get("env_id"))
+    if redact is not None:
+        text = redact(text)
+    return jsonify({"case_id": case_id, "log": text})
 
 
 @api.delete("/builds/<build_id>")
@@ -440,6 +486,9 @@ def build_report(build_id: str):
     report = _report().build_report(build["project_id"], build_id, force=force)
     if "error" in report:
         return _err(report["error"], 404)
+    redact = _redactor_for_env_id(build.get("env_id"))
+    if redact is not None:
+        report = redact(report)
     return jsonify(report)
 
 
@@ -523,7 +572,8 @@ def delete_defect(defect_id: str):
 
 @api.get("/projects/<project_id>/environments")
 def list_environments(project_id: str):
-    return jsonify({"environments": _env_mgr().list(project_id)})
+    # 敏感变量在列表接口同样只回掩码
+    return jsonify({"environments": _env_mgr().list_public(project_id)})
 
 
 @api.post("/projects/<project_id>/environments")
@@ -531,7 +581,8 @@ def create_environment(project_id: str):
     data = _payload()
     if not (data.get("name") or "").strip():
         return _err("环境名称不能为空")
-    return jsonify(_env_mgr().create(project_id, data))
+    env = _env_mgr().create(project_id, data)
+    return jsonify(_env_mgr().public_view(env))
 
 
 @api.get("/environments/<env_id>")
@@ -539,7 +590,7 @@ def get_environment(env_id: str):
     env = _env_mgr().get(env_id)
     if env is None:
         return _err("环境不存在", 404)
-    return jsonify(env)
+    return jsonify(_env_mgr().public_view(env))
 
 
 @api.put("/environments/<env_id>")
@@ -549,9 +600,11 @@ def update_environment(env_id: str):
         return _err("环境不存在", 404)
     data = _payload()
     patch = {k: data[k] for k in ("name", "description", "python_version",
-                                  "base_image", "variables", "dependencies", "config")
+                                  "base_image", "variables", "dependencies", "config",
+                                  "sensitive_variables")
              if k in data}
-    return jsonify(_env_mgr().update(env_id, patch))
+    updated = _env_mgr().update(env_id, patch)
+    return jsonify(_env_mgr().public_view(updated))
 
 
 @api.delete("/environments/<env_id>")
@@ -563,6 +616,37 @@ def delete_environment(env_id: str):
 @api.get("/environments/<env_id>/resolve")
 def resolve_environment(env_id: str):
     return jsonify(_env_mgr().resolve(env_id))
+
+
+@api.get("/environments/<env_id>/export")
+def export_environment(env_id: str):
+    """导出环境留档：敏感值一律掩码。?download=1 时作为附件下载。"""
+    payload = _env_mgr().export(env_id)
+    if payload is None:
+        return _err("环境不存在", 404)
+    if request.args.get("download") == "1":
+        return _download_json(payload, f"environment_{env_id}.json")
+    return jsonify(payload)
+
+
+@api.get("/envs/diff")
+def diff_environments():
+    """两个环境逐项对比（变量 / 依赖 / 运行参数），敏感值只回掩码。
+
+    查询参数：``base``、``target`` 为两个环境 id；
+    ``download=1`` 时把差异结果作为 JSON 附件导出留档。
+    """
+    base_id = request.args.get("base")
+    target_id = request.args.get("target")
+    if not base_id or not target_id:
+        return _err("需要提供 base 与 target 两个环境 id")
+    result = _env_mgr().diff(base_id, target_id)
+    if "error" in result:
+        return _err(result["error"], 404)
+    if request.args.get("download") == "1":
+        filename = f"env_diff_{base_id[:12]}_vs_{target_id[:12]}.json"
+        return _download_json(result, filename)
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------

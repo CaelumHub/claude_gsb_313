@@ -190,6 +190,176 @@ class TestEnvironments(unittest.TestCase):
         self.assertEqual(snap["variables"]["X"], "1")
 
 
+class TestSensitiveVariables(unittest.TestCase):
+    """敏感变量：明文照常执行注入，但所有对外出口都是掩码。"""
+
+    SECRET = "db-password-123"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.registry = StoreRegistry(os.path.join(self.tmp.name, "store"))
+        self.mgr = EnvironmentManager(self.registry, self.tmp.name)
+        self.env = self.mgr.create("p1", {
+            "name": "dev",
+            "variables": {"REGION": "dev", "DB_PASSWORD": self.SECRET},
+            "sensitive_variables": ["DB_PASSWORD"],
+        })
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_public_view_masks_sensitive(self):
+        view = self.mgr.public_view(self.mgr.get(self.env["id"]))
+        self.assertEqual(view["variables"]["DB_PASSWORD"], "******")
+        self.assertEqual(view["variables"]["REGION"], "dev")
+        # 列表接口同样掩码
+        self.assertEqual(self.mgr.list_public("p1")[0]["variables"]["DB_PASSWORD"], "******")
+
+    def test_snapshot_and_executor_config_keep_plaintext(self):
+        snap = self.mgr.snapshot(self.env["id"])
+        self.assertEqual(snap["variables"]["DB_PASSWORD"], self.SECRET)
+        self.assertEqual(snap["sensitive_variables"], ["DB_PASSWORD"])
+        cfg = self.mgr.to_executor_config(self.env["id"])
+        self.assertEqual(cfg["variables"]["DB_PASSWORD"], self.SECRET)
+        self.assertEqual(cfg["_sensitive_variables"], ["DB_PASSWORD"])
+
+    def test_export_masks_sensitive(self):
+        doc = self.mgr.export(self.env["id"])
+        self.assertEqual(doc["environment"]["variables"]["DB_PASSWORD"], "******")
+        self.assertIn("DB_PASSWORD", doc["environment"]["sensitive_variables"])
+        self.assertNotIn(self.SECRET, repr(doc))
+
+    def test_update_with_mask_keeps_original(self):
+        # 前端编辑时把敏感值留成掩码哨兵提交 -> 原明文保留
+        updated = self.mgr.update(self.env["id"], {
+            "variables": {"REGION": "dev2", "DB_PASSWORD": "******"},
+            "sensitive_variables": ["DB_PASSWORD"],
+        })
+        self.assertEqual(updated["variables"]["DB_PASSWORD"], self.SECRET)
+        self.assertEqual(updated["variables"]["REGION"], "dev2")
+
+    def test_update_sensitive_value(self):
+        # 输入新值则覆盖
+        updated = self.mgr.update(self.env["id"], {
+            "variables": {"REGION": "dev", "DB_PASSWORD": "new-secret"},
+            "sensitive_variables": ["DB_PASSWORD"],
+        })
+        self.assertEqual(updated["variables"]["DB_PASSWORD"], "new-secret")
+
+    def test_unmark_sensitive(self):
+        updated = self.mgr.update(self.env["id"], {
+            "variables": {"REGION": "dev", "DB_PASSWORD": "visible-now"},
+            "sensitive_variables": [],
+        })
+        self.assertEqual(updated["sensitive_variables"], [])
+        self.assertEqual(self.mgr.public_view(updated)["variables"]["DB_PASSWORD"], "visible-now")
+
+
+class TestLogRedaction(unittest.TestCase):
+    """执行日志 / 结果中的敏感原值必须被掩码。"""
+
+    SECRET = "s3cr3t-token"
+
+    def _env_config(self):
+        return {"latency_ms": 0, "variables": {"TOKEN": self.SECRET},
+                "_sensitive_variables": ["TOKEN"]}
+
+    def test_set_step_message_redacted(self):
+        case = {"id": "c", "name": "设置口令", "steps": [
+            {"action": "set", "key": "t", "value": "${TOKEN}", "name": "写入令牌"},
+        ]}
+        result = TestExecutor().execute_case(case, self._env_config())
+        flat = repr(result)
+        self.assertNotIn(self.SECRET, flat)
+        self.assertIn("******", result["logs"][-1])
+
+    def test_failed_assertion_actual_redacted(self):
+        case = {"id": "c2", "name": "断言口令", "steps": [
+            {"action": "assert", "type": "equals",
+             "actual": "${TOKEN}", "expected": "other", "name": "口令应匹配"},
+        ]}
+        result = TestExecutor().execute_case(case, self._env_config())
+        self.assertNotIn(self.SECRET, repr(result["assertions"]))
+        self.assertNotIn(self.SECRET, "\n".join(result["logs"]))
+        self.assertEqual(result["assertions"][0]["actual"], "******")
+
+    def test_numeric_secret_redacted(self):
+        case = {"id": "c3", "name": "数字口令", "steps": [
+            {"action": "set", "key": "pin", "value": "${PIN}", "name": "写入 PIN"},
+        ]}
+        cfg = {"latency_ms": 0, "variables": {"PIN": 1234567},
+               "_sensitive_variables": ["PIN"]}
+        result = TestExecutor().execute_case(case, cfg)
+        self.assertNotIn("1234567", repr(result))
+
+
+class TestEnvironmentDiff(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.registry = StoreRegistry(os.path.join(self.tmp.name, "store"))
+        self.mgr = EnvironmentManager(self.registry, self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _map(self, rows, key_field="key"):
+        return {r[key_field]: r for r in rows}
+
+    def test_diff_variables_deps_config(self):
+        a = self.mgr.create("p1", {
+            "name": "dev", "python_version": "3.11",
+            "variables": {"REGION": "dev", "ONLY_A": "x", "DB_PASSWORD": "p-dev"},
+            "sensitive_variables": ["DB_PASSWORD"],
+            "dependencies": [{"name": "requests", "constraint": ">=2.0"},
+                             {"name": "flask", "constraint": ">=3.0"}],
+            "config": {"base_url": "http://a", "latency_ms": 10, "fail_rate": 0.0},
+        })
+        b = self.mgr.create("p1", {
+            "name": "staging", "python_version": "3.12",
+            "variables": {"REGION": "staging", "ONLY_B": "y", "DB_PASSWORD": "p-stg"},
+            "sensitive_variables": ["DB_PASSWORD"],
+            "dependencies": [{"name": "requests", "constraint": ">=2.30"},
+                             {"name": "django", "constraint": ">=4.2"}],
+            "config": {"base_url": "http://b", "latency_ms": 10, "fail_rate": 0.2},
+        })
+        d = self.mgr.diff(a["id"], b["id"])
+        vars_ = self._map(d["variables"])
+        self.assertEqual(vars_["REGION"]["status"], "changed")
+        self.assertEqual(vars_["ONLY_A"]["status"], "removed")
+        self.assertEqual(vars_["ONLY_B"]["status"], "added")
+        # 敏感项：明文不同 -> changed，但两侧值都只回掩码
+        self.assertEqual(vars_["DB_PASSWORD"]["status"], "changed")
+        self.assertTrue(vars_["DB_PASSWORD"]["sensitive"])
+        self.assertEqual(vars_["DB_PASSWORD"]["base_value"], "******")
+        self.assertEqual(vars_["DB_PASSWORD"]["target_value"], "******")
+        self.assertNotIn("p-dev", repr(d))
+        self.assertNotIn("p-stg", repr(d))
+
+        deps = self._map(d["dependencies"], "name")
+        self.assertEqual(deps["requests"]["status"], "changed")
+        self.assertEqual(deps["flask"]["status"], "removed")
+        self.assertEqual(deps["django"]["status"], "added")
+
+        cfg = self._map(d["config"])
+        self.assertEqual(cfg["base_url"]["status"], "changed")
+        self.assertEqual(cfg["latency_ms"]["status"], "same")
+        self.assertEqual(cfg["fail_rate"]["status"], "changed")
+
+    def test_diff_identical_envs(self):
+        payload = {"name": "x", "variables": {"A": "1"},
+                   "dependencies": [{"name": "requests", "constraint": "*"}],
+                   "config": {"base_url": "u", "latency_ms": 1, "fail_rate": 0}}
+        a = self.mgr.create("p1", payload)
+        b = self.mgr.create("p1", payload)
+        d = self.mgr.diff(a["id"], b["id"])
+        for section in ("variables", "dependencies", "config", "meta"):
+            self.assertTrue(all(r["status"] == "same" for r in d[section]))
+
+    def test_diff_missing_env(self):
+        a = self.mgr.create("p1", {"name": "x"})
+        self.assertIn("error", self.mgr.diff(a["id"], "env_nonexistent"))
+
+
 class TestCoverage(unittest.TestCase):
     def test_stable_per_build(self):
         with tempfile.TemporaryDirectory() as d:

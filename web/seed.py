@@ -30,7 +30,12 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "name": "dev 开发环境",
         "python_version": "3.11",
         "base_image": "python:3.11-slim",
-        "variables": {"BASE_URL": "http://dev.mock.local", "REGION": "dev"},
+        "variables": {
+            "BASE_URL": "http://dev.mock.local",
+            "REGION": "dev",
+            "DB_PASSWORD": "dev-secret-p@ss",
+        },
+        "sensitive_variables": ["DB_PASSWORD"],
         "config": {"base_url": "http://dev.mock.local", "latency_ms": 15, "fail_rate": 0.0},
         "dependencies": [
             {"name": "requests", "constraint": ">=2.28"},
@@ -42,7 +47,12 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "name": "staging 预发环境",
         "python_version": "3.12",
         "base_image": "python:3.12-slim",
-        "variables": {"BASE_URL": "http://staging.mock.local", "REGION": "staging"},
+        "variables": {
+            "BASE_URL": "http://staging.mock.local",
+            "REGION": "staging",
+            "DB_PASSWORD": "staging-secret-p@ss",
+        },
+        "sensitive_variables": ["DB_PASSWORD"],
         "config": {"base_url": "http://staging.mock.local", "latency_ms": 45, "fail_rate": 0.15},
         "dependencies": [
             {"name": "requests", "constraint": ">=2.30"},

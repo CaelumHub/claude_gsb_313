@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from .cron import cron_matches, parse_cron
+from .environments import make_redactor, sensitive_secret_map
 from .models import new_id
 
 
@@ -149,6 +150,11 @@ class Scheduler:
                    env_id: str, cancel_event: threading.Event) -> None:
         store = self.builds.for_project(project_id)
         env_config = self.env_manager.to_executor_config(env_id)
+        # 敏感变量明文表：执行器已在返回前脱敏，这里再用于异常兜底路径，
+        # 确保任何写进日志 / 结果文件的文本都不含敏感原值。
+        redact = make_redactor(list(sensitive_secret_map(
+            env_config.get("variables", {}),
+            env_config.get("_sensitive_variables", [])).values()))
         store.set_total(build_id, len(cases))
         store.append_log(build_id, f"构建 {build_id} 开始，共 {len(cases)} 个用例，"
                                    f"环境 {env_id}")
@@ -179,7 +185,7 @@ class Scheduler:
                             "duration": 0.0,
                             "steps": [],
                             "assertions": [],
-                            "logs": [f"用例执行异常: {exc}"],
+                            "logs": [redact(f"用例执行异常: {exc}")],
                         }
                     self._persist_result(store, build_id, case, result)
                 # 未提交的用例（被取消跳过）记为 skipped
@@ -198,7 +204,7 @@ class Scheduler:
                         }
                         self._persist_result(store, build_id, case, skipped)
         except Exception as exc:  # noqa: BLE001
-            store.append_log(build_id, f"构建执行异常: {exc}")
+            store.append_log(build_id, redact(f"构建执行异常: {exc}"))
 
         # 终态判定
         build = store.get(build_id)

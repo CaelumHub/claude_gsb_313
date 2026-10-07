@@ -26,6 +26,7 @@ import time
 from typing import Any, Optional
 
 from .models import new_id
+from .environments import make_redactor, sensitive_secret_map
 
 
 class ExecutionError(Exception):
@@ -358,7 +359,12 @@ class TestExecutor:
     # -- 用例执行 ---------------------------------------------------------
     def execute_case(self, case: dict, env_config: dict = None,
                      cancel_event=None, timeout: float = None) -> dict:
-        """执行一个用例，返回结构化的执行结果。"""
+        """执行一个用例，返回结构化的执行结果。
+
+        若 ``env_config`` 带 ``_sensitive_variables``（由环境快照注入），
+        返回结果中的日志 / 步骤消息 / 断言实际值都会按敏感原值脱敏，
+        保证口令不会顺着执行日志和结果文件漏出去；变量表本身不放进结果。
+        """
         env_config = env_config or {}
         case_id = case.get("id", new_id("case"))
         case_name = case.get("name", "未命名用例")
@@ -370,6 +376,11 @@ class TestExecutor:
         variables = dict(env_config.get("variables", {}))
         variables["case"] = {"id": case_id, "name": case_name}
 
+        # 敏感变量 -> 明文原值，用于执行产物脱敏（脱敏发生在返回前）
+        secret_map = sensitive_secret_map(
+            variables, env_config.get("_sensitive_variables", []))
+        redact = make_redactor(list(secret_map.values()))
+
         logs: list[str] = [
             f"开始执行用例 {case_name} (id={case_id})，超时 {timeout}s",
         ]
@@ -378,8 +389,9 @@ class TestExecutor:
         status = "passed"
 
         if not case.get("enabled", True):
-            return self._finalize(case, "skipped", steps_out, [], logs, started,
-                                  "用例已禁用")
+            return self._redact_result(self._finalize(
+                case, "skipped", steps_out, [], logs, started,
+                "用例已禁用"), redact)
 
         steps = case.get("steps") or []
         for idx, step in enumerate(steps):
@@ -410,7 +422,25 @@ class TestExecutor:
             logs.append(f"用例总耗时超过 {timeout}s")
 
         assertions = variables.get("_assertions", [])
-        return self._finalize(case, status, steps_out, assertions, logs, started)
+        return self._redact_result(
+            self._finalize(case, status, steps_out, assertions, logs, started),
+            redact)
+
+    @staticmethod
+    def _redact_result(result: dict, redact) -> dict:
+        """对执行产物整体脱敏：步骤消息、断言、日志里的敏感原值一律掩码。
+
+        结果里没有变量表本身，但 ``set`` 步骤消息、失败断言的实际值、
+        请求回显等都可能带出敏感变量，因此对所有文本与结构化字段递归处理。
+        """
+        for field in ("message",):
+            if field in result:
+                result[field] = redact(result[field])
+        for field in ("logs",):
+            result[field] = [redact(line) for line in result.get(field, [])]
+        for field in ("steps", "assertions"):
+            result[field] = redact(result.get(field, []))
+        return result
 
     def _finalize(self, case: dict, status: str, steps: list, assertions: list,
                   logs: list, started: float, message: str = "") -> dict:
